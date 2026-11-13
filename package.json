@@ -27,7 +27,7 @@
   "author": "JetKVM",
   "license": "GPL-2.0",
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.654.0",
+    "@aws-sdk/client-s3": "^3.1169.0",
     "@prisma/client": "^5.13.0",
     "cookie-session": "^2.1.0",
     "cors": "^2.8.5",
