@@ -1,0 +1,9 @@
+.github/
+.idea/
+node_modules/
+dist/
+.DS_Store
+.env
+.git
+.env.*
+!.env.example

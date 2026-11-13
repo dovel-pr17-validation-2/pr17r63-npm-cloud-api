@@ -1,0 +1,1751 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { Request, Response } from "express";
+import {
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+} from "@aws-sdk/client-s3";
+import { s3Mock, createAsyncIterable, testPrisma, resetToSeedData } from "./setup";
+import { BadRequestError, NotFoundError, InternalServerError } from "../src/errors";
+
+// Import the module under test after setup
+import {
+  Retrieve,
+  RetrieveLatestApp,
+  RetrieveLatestSystemRecovery,
+  clearCaches,
+} from "../src/releases";
+import { legacyCompatibleSkus, otaFileForPrefix } from "../src/skus";
+
+type ReleaseType = string;
+
+const DEFAULT_SKU = "jetkvm-v2";
+const SDMMC_SKU = "jetkvm-v2-sdmmc";
+const MINI_ETHERNET_SKU = "jetkvm-mini-ethernet";
+const MINI_WIRELESS_SKU = "jetkvm-mini-wireless";
+
+// Helper to create mock Request
+function createMockRequest(query: Record<string, string | undefined> = {}): Request {
+  return {
+    query,
+  } as unknown as Request;
+}
+
+// Helper to create mock Response
+function createMockResponse(): Response & {
+  _json: any;
+  _redirectUrl: string;
+  _redirectStatus: number;
+} {
+  const res = {
+    _json: null,
+    _redirectUrl: "",
+    _redirectStatus: 0,
+    json: vi.fn(function (this: any, data: any) {
+      this._json = data;
+      return this;
+    }),
+    redirect: vi.fn(function (this: any, status: number, url: string) {
+      this._redirectStatus = status;
+      this._redirectUrl = url;
+      return this;
+    }),
+  } as unknown as Response & {
+    _json: any;
+    _redirectUrl: string;
+    _redirectStatus: number;
+  };
+  return res;
+}
+
+// Mock S3 responses for listing versions
+function mockS3ListVersions(prefix: ReleaseType, versions: string[]) {
+  s3Mock.on(ListObjectsV2Command, { Prefix: `${prefix}/` }).resolves({
+    CommonPrefixes: versions.map(v => ({ Prefix: `${prefix}/${v}/` })),
+  });
+}
+
+// Mock S3 hash file response for legacy versions (no SKU support)
+function mockS3HashFile(
+  prefix: ReleaseType,
+  version: string,
+  hash: string,
+  opts?: { hasSig?: boolean },
+) {
+  const fileName = otaFileForPrefix(prefix);
+  const artifactPath = `${prefix}/${version}/${fileName}`;
+
+  // Mock versionHasSkuSupport to return false (no SKU folders)
+  s3Mock.on(ListObjectsV2Command, { Prefix: `${prefix}/${version}/skus/` }).resolves({
+    Contents: [],
+  });
+
+  // The legacy artifact and its hash
+  s3Mock.on(HeadObjectCommand, { Key: artifactPath }).resolves({});
+  s3Mock.on(GetObjectCommand, { Key: `${artifactPath}.sha256` }).resolves({
+    Body: createAsyncIterable(hash) as any,
+  });
+
+  // Mock .sig existence check (absence handled by default HeadObject reject in beforeEach)
+  if (opts?.hasSig) {
+    s3Mock.on(HeadObjectCommand, { Key: `${artifactPath}.sig` }).resolves({});
+  }
+}
+
+// Mock S3 for versions with SKU support
+function mockS3SkuVersion(
+  prefix: ReleaseType,
+  version: string,
+  sku: string,
+  hash: string,
+  opts?: { hasSig?: boolean },
+) {
+  const fileName = otaFileForPrefix(prefix);
+  const skuPath = `${prefix}/${version}/skus/${sku}/${fileName}`;
+
+  // Mock versionHasSkuSupport to return true (has SKU folders)
+  s3Mock.on(ListObjectsV2Command, { Prefix: `${prefix}/${version}/skus/` }).resolves({
+    Contents: [{ Key: skuPath }],
+  });
+
+  // Mock SKU artifact exists (HeadObjectCommand for existence check)
+  s3Mock.on(HeadObjectCommand, { Key: skuPath }).resolves({});
+
+  // Mock SKU hash path
+  s3Mock.on(GetObjectCommand, { Key: `${skuPath}.sha256` }).resolves({
+    Body: createAsyncIterable(hash) as any,
+  });
+
+  // Mock .sig existence check (absence handled by default HeadObject reject in beforeEach)
+  if (opts?.hasSig) {
+    s3Mock.on(HeadObjectCommand, { Key: `${skuPath}.sig` }).resolves({});
+  }
+}
+
+// Mock S3 for legacy version with file content (for redirect endpoints with hash verification)
+function mockS3LegacyVersionWithContent(
+  prefix: ReleaseType,
+  version: string,
+  fileName: string,
+  content: string,
+  hash: string,
+) {
+  // Mock versionHasSkuSupport to return false (no SKU folders)
+  s3Mock.on(ListObjectsV2Command, { Prefix: `${prefix}/${version}/skus/` }).resolves({
+    Contents: [],
+  });
+
+  // Legacy artifact exists (HeadObjectCommand for the existence check)
+  s3Mock.on(HeadObjectCommand, { Key: `${prefix}/${version}/${fileName}` }).resolves({});
+
+  // Mock legacy file path with content
+  s3Mock.on(GetObjectCommand, { Key: `${prefix}/${version}/${fileName}` }).resolves({
+    Body: createAsyncIterable(content) as any,
+  });
+  s3Mock
+    .on(GetObjectCommand, { Key: `${prefix}/${version}/${fileName}.sha256` })
+    .resolves({
+      Body: createAsyncIterable(hash) as any,
+    });
+}
+
+// Mock S3 for SKU version with file content (for redirect endpoints with hash verification)
+function mockS3SkuVersionWithContent(
+  prefix: ReleaseType,
+  version: string,
+  sku: string,
+  fileName: string,
+  content: string,
+  hash: string,
+) {
+  const skuPath = `${prefix}/${version}/skus/${sku}/${fileName}`;
+
+  // Mock versionHasSkuSupport to return true (has SKU folders)
+  s3Mock.on(ListObjectsV2Command, { Prefix: `${prefix}/${version}/skus/` }).resolves({
+    Contents: [{ Key: skuPath }],
+  });
+
+  // Mock SKU artifact exists (HeadObjectCommand for existence check)
+  s3Mock.on(HeadObjectCommand, { Key: skuPath }).resolves({});
+
+  // Mock SKU artifact with content (GetObjectCommand for actual fetch)
+  s3Mock.on(GetObjectCommand, { Key: skuPath }).resolves({
+    Body: createAsyncIterable(content) as any,
+  });
+
+  // Mock SKU hash path
+  s3Mock.on(GetObjectCommand, { Key: `${skuPath}.sha256` }).resolves({
+    Body: createAsyncIterable(hash) as any,
+  });
+}
+
+function artifactFileName(type: ReleaseType) {
+  return otaFileForPrefix(type);
+}
+
+function artifactPath(type: ReleaseType, version: string, sku = DEFAULT_SKU) {
+  const fileName = artifactFileName(type);
+  if (legacyCompatibleSkus(type).includes(sku)) {
+    return `${type}/${version}/${fileName}`;
+  }
+  return `${type}/${version}/skus/${sku}/${fileName}`;
+}
+
+function artifactUrl(type: ReleaseType, version: string, sku = DEFAULT_SKU) {
+  return `https://cdn.test.com/${artifactPath(type, version, sku)}`;
+}
+
+function mockArtifactSig(type: ReleaseType, version: string, sku = DEFAULT_SKU) {
+  s3Mock
+    .on(HeadObjectCommand, { Key: `${artifactPath(type, version, sku)}.sig` })
+    .resolves({});
+}
+
+function releaseArtifact(
+  type: ReleaseType,
+  version: string,
+  sku = DEFAULT_SKU,
+  hash = `${type}-${version}-${sku}-hash`,
+) {
+  return {
+    url: artifactUrl(type, version, sku),
+    hash,
+    compatibleSkus: [sku],
+  };
+}
+
+async function createDbRelease(
+  type: ReleaseType,
+  version: string,
+  rolloutPercentage: number,
+  artifacts = [releaseArtifact(type, version)],
+) {
+  const primaryArtifact = artifacts[0];
+  await testPrisma.release.create({
+    data: {
+      version,
+      type,
+      rolloutPercentage,
+      url: primaryArtifact.url,
+      hash: primaryArtifact.hash,
+      artifacts: { create: artifacts },
+    },
+  });
+}
+
+async function createDbReleasePair(version: string, rolloutPercentage: number) {
+  await createDbRelease("app", version, rolloutPercentage);
+  await createDbRelease("system", version, rolloutPercentage);
+}
+
+function jsonBody(res: { _json: unknown }) {
+  return JSON.parse(JSON.stringify(res._json));
+}
+
+describe("Retrieve handler", () => {
+  beforeEach(() => {
+    s3Mock.reset();
+    // Default: .sig files don't exist unless explicitly mocked per-key.
+    // More specific .on(HeadObjectCommand, { Key }) mocks take precedence.
+    s3Mock
+      .on(HeadObjectCommand)
+      .rejects({ name: "NotFound", $metadata: { httpStatusCode: 404 } });
+    clearCaches();
+  });
+
+  describe("input validation", () => {
+    it("should throw BadRequestError when deviceId is missing", async () => {
+      const req = createMockRequest({});
+      const res = createMockResponse();
+
+      await expect(Retrieve(req, res)).rejects.toThrow(BadRequestError);
+      await expect(Retrieve(req, res)).rejects.toThrow("Device ID is required");
+    });
+
+    it("should throw BadRequestError when deviceId is empty string", async () => {
+      const req = createMockRequest({ deviceId: "" });
+      const res = createMockResponse();
+
+      // Empty string is falsy, so it should throw
+      await expect(Retrieve(req, res)).rejects.toThrow(BadRequestError);
+    });
+  });
+
+  describe("SKU validation", () => {
+    it("rejects a SKU that is not registered before touching S3 or the DB", async () => {
+      const res = createMockResponse();
+      await expect(
+        Retrieve(createMockRequest({ deviceId: "x", sku: "jetkvm-v3" }), res),
+      ).rejects.toThrow(BadRequestError);
+      await expect(
+        Retrieve(createMockRequest({ deviceId: "x", sku: "jetkvm-v3" }), res),
+      ).rejects.toThrow('Unknown SKU "jetkvm-v3"');
+      expect(s3Mock.calls().length).toBe(0);
+    });
+
+    it("rejects an unregistered SKU on the app redirect", async () => {
+      const res = createMockResponse();
+      await expect(RetrieveLatestApp(createMockRequest({ sku: "jetkvm-v3" }), res)).rejects.toThrow(
+        'Unknown SKU "jetkvm-v3"',
+      );
+    });
+  });
+
+  describe("S3 error handling", () => {
+    it("should throw NotFoundError when no versions exist in S3", async () => {
+      const req = createMockRequest({ deviceId: "device-123", prerelease: "true" });
+      const res = createMockResponse();
+
+      // Mock empty S3 response for both app and system
+      s3Mock.on(ListObjectsV2Command).resolves({ CommonPrefixes: [] });
+
+      await expect(Retrieve(req, res)).rejects.toThrow(NotFoundError);
+    });
+
+    it("should throw NotFoundError when no valid semver versions exist", async () => {
+      const req = createMockRequest({ deviceId: "device-123", prerelease: "true" });
+      const res = createMockResponse();
+
+      // Mock S3 with invalid version names
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [
+          { Prefix: "app/invalid-version/" },
+          { Prefix: "app/not-semver/" },
+        ],
+      });
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [
+          { Prefix: "system/invalid-version/" },
+          { Prefix: "system/not-semver/" },
+        ],
+      });
+
+      await expect(Retrieve(req, res)).rejects.toThrow(NotFoundError);
+    });
+  });
+
+  describe("prerelease mode", () => {
+    it("checks only the five newest versions for a SKU that none of them ships", async () => {
+      // Defaults first: a later mock for the same command takes precedence.
+      s3Mock.on(ListObjectsV2Command, { MaxKeys: 1 }).resolves({ Contents: [{ Key: "x" }] });
+      s3Mock
+        .on(HeadObjectCommand)
+        .rejects({ name: "NotFound", $metadata: { httpStatusCode: 404 } });
+      // 20 app versions with a skus/ folder; only the oldest, 1.0.0, has an SDMMC build.
+      // The system part has a valid SDMMC build, so only the app part fails.
+      mockS3ListVersions("app", Array.from({ length: 20 }, (_, i) => `1.${i}.0`));
+      mockS3ListVersions("system", ["1.0.0"]);
+      mockS3SkuVersion("system", "1.0.0", "jetkvm-v2-sdmmc", "system-hash");
+      s3Mock
+        .on(HeadObjectCommand, { Key: "app/1.0.0/skus/jetkvm-v2-sdmmc/jetkvm_app" })
+        .resolves({});
+
+      await expect(
+        Retrieve(
+          createMockRequest({ deviceId: "device-123", prerelease: "true", sku: "jetkvm-v2-sdmmc" }),
+          createMockResponse(),
+        ),
+      ).rejects.toThrow(NotFoundError);
+      // One app version listing, then one skus/ check per version for the newest five
+      const appListings = s3Mock
+        .commandCalls(ListObjectsV2Command)
+        .filter(call => call.args[0].input.Prefix?.startsWith("app/"));
+      expect(appListings).toHaveLength(1 + 5);
+    });
+
+    it("should return latest prerelease version when prerelease=true", async () => {
+      const req = createMockRequest({ deviceId: "device-123", prerelease: "true" });
+      const res = createMockResponse();
+
+      // Mock S3 with stable and prerelease versions
+      mockS3ListVersions("app", ["1.0.0", "1.1.0", "2.0.0-beta.1"]);
+      mockS3ListVersions("system", ["1.0.0", "1.1.0", "2.0.0-alpha.1"]);
+      mockS3HashFile("app", "2.0.0-beta.1", "prerelease-app-hash");
+      mockS3HashFile("system", "2.0.0-alpha.1", "prerelease-system-hash");
+
+      await Retrieve(req, res);
+
+      expect(res.json).toHaveBeenCalled();
+      expect(res._json.appVersion).toBe("2.0.0-beta.1");
+      expect(res._json.systemVersion).toBe("2.0.0-alpha.1");
+    });
+
+    it("should skip rollout logic for prereleases", async () => {
+      // Use version constraints to get unique cache keys
+      // Note: 3.1.0-rc.1 satisfies ^3.0.0 (3.0.0-rc.1 would NOT satisfy it since prereleases < release)
+      const req = createMockRequest({
+        deviceId: "device-456",
+        prerelease: "true",
+        appVersion: "^3.0.0",
+        systemVersion: "^3.0.0",
+      });
+      const res = createMockResponse();
+
+      mockS3ListVersions("app", ["3.0.0", "3.1.0-rc.1"]);
+      mockS3ListVersions("system", ["3.0.0", "3.1.0-rc.1"]);
+      mockS3HashFile("app", "3.1.0-rc.1", "rc-app-hash");
+      mockS3HashFile("system", "3.1.0-rc.1", "rc-system-hash");
+
+      await Retrieve(req, res);
+
+      // Should return prerelease directly without checking DB rollout
+      expect(res._json.appVersion).toBe("3.1.0-rc.1");
+      expect(res._json.systemVersion).toBe("3.1.0-rc.1");
+    });
+  });
+
+  describe("stable DB-backed contract", () => {
+    beforeEach(async () => {
+      await resetToSeedData();
+    });
+
+    it("serves the latest fully rolled out release on background checks", async () => {
+      await createDbReleasePair("2.0.0", 100);
+      await createDbReleasePair("2.1.0", 0);
+      mockArtifactSig("app", "2.0.0");
+      mockArtifactSig("system", "2.0.0");
+
+      const res = createMockResponse();
+
+      await Retrieve(createMockRequest({ deviceId: "stable-background-device" }), res);
+
+      expect(jsonBody(res)).toMatchObject({
+        appVersion: "2.0.0",
+        appUrl: artifactUrl("app", "2.0.0"),
+        appHash: "app-2.0.0-jetkvm-v2-hash",
+        appSigUrl: `${artifactUrl("app", "2.0.0")}.sig`,
+        systemVersion: "2.0.0",
+        systemUrl: artifactUrl("system", "2.0.0"),
+        systemHash: "system-2.0.0-jetkvm-v2-hash",
+        systemSigUrl: `${artifactUrl("system", "2.0.0")}.sig`,
+      });
+    });
+
+    it("keeps an in-progress rollout when a newer release is registered at 0%", async () => {
+      // early-adopter hashes to bucket 8, late-adopter to bucket 95.
+      await createDbReleasePair("2.0.0", 100);
+      await createDbReleasePair("2.1.0", 50);
+      await createDbReleasePair("2.2.0", 0);
+
+      const inBucket = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "early-adopter" }), inBucket);
+      expect(jsonBody(inBucket)).toMatchObject({ appVersion: "2.1.0", systemVersion: "2.1.0" });
+
+      const outOfBucket = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "late-adopter" }), outOfBucket);
+      expect(jsonBody(outOfBucket)).toMatchObject({ appVersion: "2.0.0", systemVersion: "2.0.0" });
+    });
+
+    it("applies app and system rollout independently", async () => {
+      await createDbReleasePair("2.4.0", 100);
+      await createDbRelease("app", "2.5.0", 100);
+      await createDbRelease("system", "2.5.0", 0);
+
+      const res = createMockResponse();
+
+      await Retrieve(createMockRequest({ deviceId: "split-rollout-device" }), res);
+
+      expect(jsonBody(res)).toMatchObject({
+        appVersion: "2.5.0",
+        appUrl: artifactUrl("app", "2.5.0"),
+        systemVersion: "2.4.0",
+        systemUrl: artifactUrl("system", "2.4.0"),
+      });
+    });
+
+    it("uses DB version ranges and bypasses rollout for constrained requests", async () => {
+      await createDbReleasePair("3.0.0", 100);
+      await createDbReleasePair("3.1.0", 0);
+      mockArtifactSig("app", "3.1.0");
+      mockArtifactSig("system", "3.0.0");
+
+      const res = createMockResponse();
+
+      await Retrieve(
+        createMockRequest({
+          deviceId: "pinned-device",
+          appVersion: "^3.0.0",
+          systemVersion: "3.0.0",
+        }),
+        res,
+      );
+
+      // Exact shape: the response carries the wire fields only, never the
+      // resolver's internal bookkeeping (cache timestamps, semver ranges).
+      expect(jsonBody(res)).toEqual({
+        appVersion: "3.1.0",
+        appUrl: artifactUrl("app", "3.1.0"),
+        appHash: "app-3.1.0-jetkvm-v2-hash",
+        appSigUrl: `${artifactUrl("app", "3.1.0")}.sig`,
+        systemVersion: "3.0.0",
+        systemUrl: artifactUrl("system", "3.0.0"),
+        systemHash: "system-3.0.0-jetkvm-v2-hash",
+        systemSigUrl: `${artifactUrl("system", "3.0.0")}.sig`,
+      });
+    });
+
+    it("pins only the requested part; the other follows the rollout", async () => {
+      await createDbReleasePair("3.0.0", 100);
+      await createDbReleasePair("3.1.0", 0);
+
+      const res = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "pinned-device", appVersion: "3.1.0" }), res);
+
+      expect(jsonBody(res)).toMatchObject({ appVersion: "3.1.0", systemVersion: "3.0.0" });
+    });
+
+    it("omits DB-backed stable sigUrl fields when sibling .sig objects are absent", async () => {
+      await createDbReleasePair("3.1.1", 100);
+      mockArtifactSig("app", "3.1.1");
+
+      const res = createMockResponse();
+
+      await Retrieve(createMockRequest({ deviceId: "stable-partial-sig-device" }), res);
+
+      expect(jsonBody(res)).toMatchObject({
+        appVersion: "3.1.1",
+        appSigUrl: `${artifactUrl("app", "3.1.1")}.sig`,
+        systemVersion: "3.1.1",
+      });
+      expect(res._json.systemSigUrl).toBeUndefined();
+    });
+
+    it("selects the artifact compatible with the requested SKU", async () => {
+      await createDbRelease("app", "3.2.0", 100, [
+        {
+          ...releaseArtifact("app", "3.2.0", DEFAULT_SKU),
+          compatibleSkus: [DEFAULT_SKU, SDMMC_SKU],
+        },
+      ]);
+      await createDbRelease("system", "3.2.0", 100, [
+        releaseArtifact("system", "3.2.0", DEFAULT_SKU, "system-default-hash"),
+        releaseArtifact("system", "3.2.0", SDMMC_SKU, "system-sdmmc-hash"),
+      ]);
+
+      const res = createMockResponse();
+
+      await Retrieve(
+        createMockRequest({
+          deviceId: "sdmmc-device",
+          sku: SDMMC_SKU,
+        }),
+        res,
+      );
+
+      expect(jsonBody(res)).toMatchObject({
+        appVersion: "3.2.0",
+        appUrl: artifactUrl("app", "3.2.0"),
+        systemVersion: "3.2.0",
+        systemUrl: artifactUrl("system", "3.2.0", SDMMC_SKU),
+        systemHash: "system-sdmmc-hash",
+      });
+    });
+
+    it("keeps the default when an in-rollout release has no compatible artifact", async () => {
+      await createDbRelease("app", "3.2.5", 100, [
+        {
+          ...releaseArtifact("app", "3.2.5", DEFAULT_SKU),
+          compatibleSkus: [DEFAULT_SKU, SDMMC_SKU],
+        },
+      ]);
+      await createDbRelease("app", "3.2.6", 10, [
+        releaseArtifact("app", "3.2.6", DEFAULT_SKU),
+      ]);
+      await createDbRelease("system", "3.2.5", 100, [
+        releaseArtifact("system", "3.2.5", DEFAULT_SKU, "system-default-hash"),
+        releaseArtifact("system", "3.2.5", SDMMC_SKU, "system-sdmmc-hash"),
+      ]);
+
+      // sdmmc-fallback-device hashes to bucket 33 — outside the 10% rollout
+      // window, so the request must not even attempt to upgrade onto 3.2.6.
+      const res = createMockResponse();
+      await Retrieve(
+        createMockRequest({
+          deviceId: "sdmmc-fallback-device",
+          sku: SDMMC_SKU,
+        }),
+        res,
+      );
+
+      expect(jsonBody(res)).toMatchObject({
+        appVersion: "3.2.5",
+        appUrl: artifactUrl("app", "3.2.5"),
+        systemVersion: "3.2.5",
+        systemUrl: artifactUrl("system", "3.2.5", SDMMC_SKU),
+        systemHash: "system-sdmmc-hash",
+      });
+    });
+
+    it("keeps the default when the latest release lacks a compatible artifact for an in-bucket device", async () => {
+      await createDbRelease("app", "3.3.0", 100, [
+        {
+          ...releaseArtifact("app", "3.3.0", DEFAULT_SKU),
+          compatibleSkus: [DEFAULT_SKU, SDMMC_SKU],
+        },
+      ]);
+      await createDbRelease("app", "3.3.1", 100, [
+        {
+          ...releaseArtifact("app", "3.3.1", DEFAULT_SKU),
+          compatibleSkus: [DEFAULT_SKU, SDMMC_SKU],
+        },
+      ]);
+      await createDbRelease("system", "3.3.0", 100, [
+        releaseArtifact("system", "3.3.0", DEFAULT_SKU, "system-default-hash"),
+        releaseArtifact("system", "3.3.0", SDMMC_SKU, "system-sdmmc-hash"),
+      ]);
+      // system 3.3.1 ships only with the default-SKU artifact — no sdmmc binary.
+      await createDbRelease("system", "3.3.1", 100);
+
+      // Every device is in-bucket at 100% rollout, so this exercises the
+      // upgrade path. The request must keep the default 3.3.0 system release
+      // rather than 404 because 3.3.1 has no sdmmc binary.
+      const res = createMockResponse();
+      await Retrieve(
+        createMockRequest({
+          deviceId: "sdmmc-compatible-fallback-device",
+          sku: SDMMC_SKU,
+        }),
+        res,
+      );
+
+      expect(jsonBody(res)).toMatchObject({
+        appVersion: "3.3.1",
+        appUrl: artifactUrl("app", "3.3.1"),
+        systemVersion: "3.3.0",
+        systemUrl: artifactUrl("system", "3.3.0", SDMMC_SKU),
+        systemHash: "system-sdmmc-hash",
+      });
+    });
+
+    it("does not discover or create stable releases from S3", async () => {
+      await createDbReleasePair("3.4.0", 100);
+      s3Mock
+        .on(ListObjectsV2Command)
+        .rejects(new Error("stable requests should not list S3"));
+      s3Mock
+        .on(GetObjectCommand)
+        .rejects(new Error("stable requests should not read S3"));
+
+      const res = createMockResponse();
+
+      await Retrieve(
+        createMockRequest({ deviceId: "db-only-device" }),
+        res,
+      );
+
+      expect(jsonBody(res)).toMatchObject({
+        appVersion: "3.4.0",
+        systemVersion: "3.4.0",
+      });
+      expect(s3Mock.commandCalls(ListObjectsV2Command)).toHaveLength(0);
+      expect(s3Mock.commandCalls(GetObjectCommand)).toHaveLength(0);
+    });
+
+    it("serves a staged release to an in-bucket device even when nothing is at 100%", async () => {
+      // early-adopter hashes to rollout bucket 8, inside a 50% rollout.
+      await testPrisma.release.updateMany({ data: { rolloutPercentage: 50 } });
+
+      const res = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "early-adopter" }), res);
+
+      expect(jsonBody(res)).toMatchObject({ appVersion: "1.2.0", systemVersion: "1.2.0" });
+    });
+
+    it("answers 404, not 500, to an out-of-bucket device when nothing is at 100%", async () => {
+      // late-adopter hashes to rollout bucket 95, outside a 50% rollout.
+      await testPrisma.release.updateMany({ data: { rolloutPercentage: 50 } });
+
+      await expect(
+        Retrieve(createMockRequest({ deviceId: "late-adopter" }), createMockResponse()),
+      ).rejects.toThrow(NotFoundError);
+      await expect(
+        Retrieve(createMockRequest({ deviceId: "late-adopter" }), createMockResponse()),
+      ).rejects.toThrow(/No (app|system) release is rolled out yet for SKU "jetkvm-v2"/);
+    });
+
+    it("serves the first staged release for a new SKU when no 100% release ships it", async () => {
+      // The seeded 100% releases carry jetkvm-v2 only. The first SDMMC build
+      // is staged at 50%: early-adopter (bucket 8) is in, late-adopter (95) out.
+      await createDbRelease("app", "1.3.0", 50, [releaseArtifact("app", "1.3.0", SDMMC_SKU)]);
+      await createDbRelease("system", "1.3.0", 50, [releaseArtifact("system", "1.3.0", SDMMC_SKU)]);
+
+      const inBucket = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "early-adopter", sku: SDMMC_SKU }), inBucket);
+      expect(jsonBody(inBucket)).toMatchObject({ appVersion: "1.3.0", systemVersion: "1.3.0" });
+
+      await expect(
+        Retrieve(createMockRequest({ deviceId: "late-adopter", sku: SDMMC_SKU }), createMockResponse()),
+      ).rejects.toThrow(/No (app|system) release is rolled out yet for SKU "jetkvm-v2-sdmmc"/);
+    });
+  });
+
+  describe("signature URL handling", () => {
+    it("should include sigUrl when .sig file exists", async () => {
+      const req = createMockRequest({
+        deviceId: "device-sig",
+        prerelease: "true",
+        appVersion: "^6.0.0",
+        systemVersion: "^6.0.0",
+      });
+      const res = createMockResponse();
+
+      mockS3ListVersions("app", ["6.0.0"]);
+      mockS3ListVersions("system", ["6.0.0"]);
+      mockS3HashFile("app", "6.0.0", "sig-app-hash", { hasSig: true });
+      mockS3HashFile("system", "6.0.0", "sig-system-hash", { hasSig: true });
+
+      await Retrieve(req, res);
+
+      expect(res._json.appSigUrl).toBe("https://cdn.test.com/app/6.0.0/jetkvm_app.sig");
+      expect(res._json.systemSigUrl).toBe(
+        "https://cdn.test.com/system/6.0.0/system.tar.sig",
+      );
+    });
+
+    it("should omit sigUrl when .sig file does not exist", async () => {
+      const req = createMockRequest({
+        deviceId: "device-nosig",
+        prerelease: "true",
+        appVersion: "^7.0.0",
+        systemVersion: "^7.0.0",
+      });
+      const res = createMockResponse();
+
+      mockS3ListVersions("app", ["7.0.0"]);
+      mockS3ListVersions("system", ["7.0.0"]);
+      mockS3HashFile("app", "7.0.0", "nosig-app-hash");
+      mockS3HashFile("system", "7.0.0", "nosig-system-hash");
+
+      await Retrieve(req, res);
+
+      expect(res._json.appSigUrl).toBeUndefined();
+      expect(res._json.systemSigUrl).toBeUndefined();
+    });
+
+    it("should include sigUrl with SKU path when .sig file exists", async () => {
+      const req = createMockRequest({
+        deviceId: "device-sku-sig",
+        prerelease: "true",
+        sku: SDMMC_SKU,
+        appVersion: "^8.0.0",
+        systemVersion: "^8.0.0",
+      });
+      const res = createMockResponse();
+
+      mockS3ListVersions("app", ["8.0.0"]);
+      mockS3ListVersions("system", ["8.0.0"]);
+      mockS3SkuVersion("app", "8.0.0", SDMMC_SKU, "sku-sig-app-hash", { hasSig: true });
+      mockS3SkuVersion("system", "8.0.0", SDMMC_SKU, "sku-sig-system-hash", {
+        hasSig: true,
+      });
+
+      await Retrieve(req, res);
+
+      expect(res._json.appSigUrl).toBe(
+        "https://cdn.test.com/app/8.0.0/skus/jetkvm-v2-sdmmc/jetkvm_app.sig",
+      );
+      expect(res._json.systemSigUrl).toBe(
+        "https://cdn.test.com/system/8.0.0/skus/jetkvm-v2-sdmmc/system.tar.sig",
+      );
+    });
+  });
+
+  describe("mini product (one over-the-air artifact)", () => {
+    function miniArtifacts(version: string) {
+      return [
+        releaseArtifact("mini", version, MINI_ETHERNET_SKU),
+        releaseArtifact("mini", version, MINI_WIRELESS_SKU),
+      ];
+    }
+
+    it("serves the mini firmware as the system artifact and omits the app fields", async () => {
+      await createDbRelease("mini", "1.0.0", 100, miniArtifacts("1.0.0"));
+
+      const res = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "mini-ethernet", sku: MINI_ETHERNET_SKU }), res);
+
+      expect(jsonBody(res)).toEqual({
+        systemVersion: "1.0.0",
+        systemUrl: artifactUrl("mini", "1.0.0", MINI_ETHERNET_SKU),
+        systemHash: "mini-1.0.0-jetkvm-mini-ethernet-hash",
+      });
+    });
+
+    it("selects the artifact for the wireless variant", async () => {
+      await createDbRelease("mini", "1.0.0", 100, miniArtifacts("1.0.0"));
+
+      const res = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "mini-wireless", sku: MINI_WIRELESS_SKU }), res);
+
+      expect(jsonBody(res)).toMatchObject({
+        systemUrl: artifactUrl("mini", "1.0.0", MINI_WIRELESS_SKU),
+        systemHash: "mini-1.0.0-jetkvm-mini-wireless-hash",
+      });
+    });
+
+    it("ignores JetKVM app/system releases and honours mini rollout state", async () => {
+      await createDbRelease("mini", "1.0.0", 100, miniArtifacts("1.0.0"));
+      await createDbRelease("mini", "1.1.0", 0, miniArtifacts("1.1.0"));
+
+      const res = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "mini-ethernet", sku: MINI_ETHERNET_SKU }), res);
+
+      // Seed data has app/system 1.2.0 in rollout; none of it leaks into the
+      // mini offer, and the 0% mini release is held back.
+      expect(jsonBody(res)).toMatchObject({ systemVersion: "1.0.0" });
+      expect(jsonBody(res)).not.toHaveProperty("appVersion");
+    });
+
+    it("honours a systemVersion constraint and ignores appVersion", async () => {
+      await createDbRelease("mini", "1.0.0", 100, miniArtifacts("1.0.0"));
+      await createDbRelease("mini", "1.1.0", 0, miniArtifacts("1.1.0"));
+
+      const res = createMockResponse();
+      await Retrieve(
+        createMockRequest({
+          deviceId: "mini-ethernet",
+          sku: MINI_ETHERNET_SKU,
+          systemVersion: "1.1.0",
+          appVersion: "9.9.9",
+        }),
+        res,
+      );
+
+      expect(jsonBody(res)).toEqual({
+        systemVersion: "1.1.0",
+        systemUrl: artifactUrl("mini", "1.1.0", MINI_ETHERNET_SKU),
+        systemHash: "mini-1.1.0-jetkvm-mini-ethernet-hash",
+      });
+    });
+
+    it("includes systemSigUrl from the mini artifact's .sig sibling", async () => {
+      await createDbRelease("mini", "1.0.0", 100, miniArtifacts("1.0.0"));
+      mockArtifactSig("mini", "1.0.0", MINI_ETHERNET_SKU);
+
+      const res = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "mini-ethernet", sku: MINI_ETHERNET_SKU }), res);
+
+      expect(jsonBody(res)).toMatchObject({
+        systemSigUrl: `${artifactUrl("mini", "1.0.0", MINI_ETHERNET_SKU)}.sig`,
+      });
+      expect(jsonBody(res)).not.toHaveProperty("appSigUrl");
+    });
+
+    it("reads prereleases from the mini/ prefix only", async () => {
+      mockS3ListVersions("mini", ["1.0.0", "1.1.0-beta.1"]);
+      mockS3SkuVersion("mini", "1.1.0-beta.1", MINI_ETHERNET_SKU, "mini-beta-hash", {
+        hasSig: true,
+      });
+
+      const res = createMockResponse();
+      await Retrieve(
+        createMockRequest({ deviceId: "mini-ethernet", sku: MINI_ETHERNET_SKU, prerelease: "true" }),
+        res,
+      );
+
+      expect(jsonBody(res)).toEqual({
+        systemVersion: "1.1.0-beta.1",
+        systemUrl: `https://cdn.test.com/mini/1.1.0-beta.1/skus/${MINI_ETHERNET_SKU}/jetkvm-mini.bin`,
+        systemHash: "mini-beta-hash",
+        systemSigUrl: `https://cdn.test.com/mini/1.1.0-beta.1/skus/${MINI_ETHERNET_SKU}/jetkvm-mini.bin.sig`,
+      });
+      // The app/ and system/ prefixes were never listed.
+      expect(
+        s3Mock.commandCalls(ListObjectsV2Command, { Prefix: "app/" }).length +
+          s3Mock.commandCalls(ListObjectsV2Command, { Prefix: "system/" }).length,
+      ).toBe(0);
+    });
+
+    it("never serves a pre-SKU mini layout", async () => {
+      mockS3ListVersions("mini", ["1.0.0"]);
+      mockS3HashFile("mini", "1.0.0", "legacy-mini-hash");
+
+      const res = createMockResponse();
+      await expect(
+        Retrieve(
+          createMockRequest({ deviceId: "mini-ethernet", sku: MINI_ETHERNET_SKU, prerelease: "true" }),
+          res,
+        ),
+      ).rejects.toThrow('Version 1.0.0 has no artifact for SKU "jetkvm-mini-ethernet"');
+    });
+
+    it("serves the first staged mini release to an in-bucket device and 404s the rest", async () => {
+      // No mini row at 100% yet: the first release is at 10%.
+      // early-adopter hashes to bucket 8, late-adopter to bucket 95.
+      await createDbRelease("mini", "1.0.0", 10, miniArtifacts("1.0.0"));
+
+      const inBucket = createMockResponse();
+      await Retrieve(createMockRequest({ deviceId: "early-adopter", sku: MINI_ETHERNET_SKU }), inBucket);
+      expect(jsonBody(inBucket)).toMatchObject({ systemVersion: "1.0.0" });
+
+      await expect(
+        Retrieve(createMockRequest({ deviceId: "late-adopter", sku: MINI_ETHERNET_SKU }), createMockResponse()),
+      ).rejects.toThrow('No mini release is rolled out yet for SKU "jetkvm-mini-ethernet"');
+    });
+
+    it("fails when no mini release exists for the SKU", async () => {
+      const res = createMockResponse();
+      await expect(
+        Retrieve(createMockRequest({ deviceId: "mini-ethernet", sku: MINI_ETHERNET_SKU }), res),
+      ).rejects.toThrow(NotFoundError);
+    });
+  });
+
+  describe("S3 non-NotFoundError handling", () => {
+    it("should wrap non-NotFoundError in InternalServerError", async () => {
+      const req = createMockRequest({ deviceId: "device-123", prerelease: "true" });
+      const res = createMockResponse();
+
+      // Mock S3 to throw a generic error (e.g., network error)
+      s3Mock.on(ListObjectsV2Command).rejects(new Error("Network timeout"));
+
+      await expect(Retrieve(req, res)).rejects.toThrow(InternalServerError);
+      await expect(Retrieve(req, res)).rejects.toThrow(
+        "Failed to get the latest release from S3",
+      );
+    });
+  });
+
+  describe("cache behavior", () => {
+    it("should return cached release on second call with same parameters", async () => {
+      const req1 = createMockRequest({
+        deviceId: "cache-test-device",
+        prerelease: "true",
+        appVersion: "^5.0.0",
+        systemVersion: "^5.0.0",
+      });
+      const res1 = createMockResponse();
+
+      mockS3ListVersions("app", ["5.0.0", "5.1.0"]);
+      mockS3ListVersions("system", ["5.0.0", "5.1.0"]);
+      mockS3HashFile("app", "5.1.0", "cache-app-hash");
+      mockS3HashFile("system", "5.1.0", "cache-system-hash");
+
+      await Retrieve(req1, res1);
+      expect(res1._json.appVersion).toBe("5.1.0");
+
+      // Reset S3 mock to return different data
+      s3Mock.reset();
+      mockS3ListVersions("app", ["5.0.0", "5.2.0"]); // Different version
+      mockS3ListVersions("system", ["5.0.0", "5.2.0"]);
+      mockS3HashFile("app", "5.2.0", "new-app-hash");
+      mockS3HashFile("system", "5.2.0", "new-system-hash");
+
+      // Second call should return cached result (5.1.0), not new S3 data (5.2.0)
+      const req2 = createMockRequest({
+        deviceId: "cache-test-device-2",
+        prerelease: "true",
+        appVersion: "^5.0.0",
+        systemVersion: "^5.0.0",
+      });
+      const res2 = createMockResponse();
+
+      await Retrieve(req2, res2);
+      expect(res2._json.appVersion).toBe("5.1.0"); // Still cached
+    });
+  });
+});
+
+describe("RetrieveLatestApp S3 redirect handler", () => {
+  beforeEach(() => {
+    s3Mock.reset();
+    clearCaches();
+  });
+
+  it("answers 404, without an older build, when the newest version has no build for the SKU", async () => {
+    // 1.1.0 ships only JetKVM v2; 1.0.0 also has an SDMMC build
+    mockS3ListVersions("app", ["1.0.0", "1.1.0"]);
+    s3Mock.on(ListObjectsV2Command, { MaxKeys: 1 }).resolves({ Contents: [{ Key: "x" }] });
+    s3Mock.on(HeadObjectCommand).rejects({ name: "NotFound", $metadata: { httpStatusCode: 404 } });
+    s3Mock
+      .on(HeadObjectCommand, { Key: "app/1.0.0/skus/jetkvm-v2-sdmmc/jetkvm_app" })
+      .resolves({});
+
+    await expect(
+      RetrieveLatestApp(createMockRequest({ sku: "jetkvm-v2-sdmmc" }), createMockResponse()),
+    ).rejects.toThrow(NotFoundError);
+  });
+
+  it("should handle all invalid semver versions gracefully", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    // All versions are invalid semver
+    s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+      CommonPrefixes: [{ Prefix: "app/not-valid/" }, { Prefix: "app/bad-version/" }],
+    });
+
+    await expect(RetrieveLatestApp(req, res)).rejects.toThrow(NotFoundError);
+  });
+
+  it("should throw NotFoundError when no app versions exist", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({ CommonPrefixes: [] });
+
+    await expect(RetrieveLatestApp(req, res)).rejects.toThrow(NotFoundError);
+  });
+
+  it("should redirect to latest stable app version", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+      CommonPrefixes: [
+        { Prefix: "app/1.0.0/" },
+        { Prefix: "app/1.1.0/" },
+        { Prefix: "app/1.2.0/" },
+      ],
+    });
+
+    // Create content and matching hash
+    const content = "app-binary-content";
+    const crypto = await import("crypto");
+    const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+    mockS3LegacyVersionWithContent("app", "1.2.0", "jetkvm_app", content, hash);
+
+    await RetrieveLatestApp(req, res);
+
+    expect(res.redirect).toHaveBeenCalledWith(
+      302,
+      "https://cdn.test.com/app/1.2.0/jetkvm_app",
+    );
+  });
+
+  it("should redirect to latest prerelease when prerelease=true", async () => {
+    const req = createMockRequest({ prerelease: "true" });
+    const res = createMockResponse();
+
+    s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+      CommonPrefixes: [
+        { Prefix: "app/1.0.0/" },
+        { Prefix: "app/1.1.0/" },
+        { Prefix: "app/2.0.0-beta.1/" },
+      ],
+    });
+
+    const content = "app-prerelease-content";
+    const crypto = await import("crypto");
+    const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+    mockS3LegacyVersionWithContent("app", "2.0.0-beta.1", "jetkvm_app", content, hash);
+
+    await RetrieveLatestApp(req, res);
+
+    expect(res.redirect).toHaveBeenCalledWith(
+      302,
+      "https://cdn.test.com/app/2.0.0-beta.1/jetkvm_app",
+    );
+  });
+
+  it("should throw NotFoundError when app file is missing", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+      CommonPrefixes: [{ Prefix: "app/1.0.0/" }],
+    });
+
+    // Mock versionHasSkuSupport to return false (no SKU folders)
+    s3Mock.on(ListObjectsV2Command, { Prefix: "app/1.0.0/skus/" }).resolves({
+      Contents: [],
+    });
+
+    s3Mock
+      .on(HeadObjectCommand, { Key: "app/1.0.0/jetkvm_app" })
+      .rejects({ name: "NotFound", $metadata: { httpStatusCode: 404 } });
+
+    await expect(RetrieveLatestApp(req, res)).rejects.toThrow(NotFoundError);
+  });
+
+  describe("SKU handling", () => {
+    it("should use legacy path when no SKU provided on legacy version", async () => {
+      const req = createMockRequest({});
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/1.0.0/" }],
+      });
+
+      const content = "legacy-app-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("app", "1.0.0", "jetkvm_app", content, hash);
+
+      await RetrieveLatestApp(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        "https://cdn.test.com/app/1.0.0/jetkvm_app",
+      );
+    });
+
+    it("should use legacy path when default SKU provided on legacy version", async () => {
+      const req = createMockRequest({ sku: "jetkvm-v2" });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/1.0.0/" }],
+      });
+
+      const content = "legacy-app-content-default-sku";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("app", "1.0.0", "jetkvm_app", content, hash);
+
+      await RetrieveLatestApp(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        "https://cdn.test.com/app/1.0.0/jetkvm_app",
+      );
+    });
+
+    it("should throw NotFoundError when non-default SKU requested on legacy version", async () => {
+      const req = createMockRequest({ sku: SDMMC_SKU });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/1.0.0/" }],
+      });
+
+      // Mock versionHasSkuSupport to return false (no SKU folders)
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/1.0.0/skus/" }).resolves({
+        Contents: [],
+      });
+
+      await expect(RetrieveLatestApp(req, res)).rejects.toThrow(NotFoundError);
+      await expect(RetrieveLatestApp(req, res)).rejects.toThrow("has no artifact for SKU");
+    });
+
+    it("redirects to the requested SKU path when the S3 version has SKU support", async () => {
+      const req = createMockRequest({ sku: SDMMC_SKU });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/2.0.0/" }],
+      });
+
+      const content = "sku-app-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3SkuVersionWithContent(
+        "app",
+        "2.0.0",
+        SDMMC_SKU,
+        "jetkvm_app",
+        content,
+        hash,
+      );
+
+      await RetrieveLatestApp(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        "https://cdn.test.com/app/2.0.0/skus/jetkvm-v2-sdmmc/jetkvm_app",
+      );
+    });
+
+    it("should use default SKU when no SKU provided on version with SKU support", async () => {
+      const req = createMockRequest({});
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/2.0.0/" }],
+      });
+
+      const content = "default-sku-app-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3SkuVersionWithContent(
+        "app",
+        "2.0.0",
+        "jetkvm-v2",
+        "jetkvm_app",
+        content,
+        hash,
+      );
+
+      await RetrieveLatestApp(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        "https://cdn.test.com/app/2.0.0/skus/jetkvm-v2/jetkvm_app",
+      );
+    });
+
+    it("should throw NotFoundError when requested SKU not available on version with SKU support", async () => {
+      const req = createMockRequest({ sku: SDMMC_SKU });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/2.0.0/" }],
+      });
+
+      // Version has SKU support (jetkvm-v2 exists) but the SDMMC SKU doesn't
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/2.0.0/skus/" }).resolves({
+        Contents: [{ Key: "app/2.0.0/skus/jetkvm-v2/jetkvm_app" }],
+      });
+      s3Mock
+        .on(HeadObjectCommand, { Key: "app/2.0.0/skus/jetkvm-v2-sdmmc/jetkvm_app" })
+        .rejects({
+          name: "NoSuchKey",
+          $metadata: { httpStatusCode: 404 },
+        });
+
+      await expect(RetrieveLatestApp(req, res)).rejects.toThrow(NotFoundError);
+      await expect(RetrieveLatestApp(req, res)).rejects.toThrow(
+        "has no artifact for SKU",
+      );
+    });
+  });
+
+  describe("cache behavior", () => {
+    it("should return cached redirect on second call with same parameters", async () => {
+      const req1 = createMockRequest({});
+      const res1 = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/1.0.0/" }],
+      });
+
+      const content = "cached-app-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("app", "1.0.0", "jetkvm_app", content, hash);
+
+      await RetrieveLatestApp(req1, res1);
+      expect(res1._redirectUrl).toBe("https://cdn.test.com/app/1.0.0/jetkvm_app");
+
+      // Reset S3 mock to return different data
+      s3Mock.reset();
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/2.0.0/" }],
+      });
+      mockS3LegacyVersionWithContent(
+        "app",
+        "2.0.0",
+        "jetkvm_app",
+        "new-content",
+        "new-hash",
+      );
+
+      // Second call should return cached result (1.0.0), not new S3 data (2.0.0)
+      const req2 = createMockRequest({});
+      const res2 = createMockResponse();
+
+      await RetrieveLatestApp(req2, res2);
+      expect(res2._redirectUrl).toBe("https://cdn.test.com/app/1.0.0/jetkvm_app");
+    });
+
+    it("should use different cache keys for different SKUs", async () => {
+      // First call with default SKU
+      const req1 = createMockRequest({});
+      const res1 = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/1.0.0/" }],
+      });
+
+      const content = "sku-cache-test";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("app", "1.0.0", "jetkvm_app", content, hash);
+
+      await RetrieveLatestApp(req1, res1);
+      expect(res1._redirectUrl).toBe("https://cdn.test.com/app/1.0.0/jetkvm_app");
+
+      // Second call with different SKU should NOT use cached result
+      s3Mock.reset();
+      s3Mock.on(ListObjectsV2Command, { Prefix: "app/" }).resolves({
+        CommonPrefixes: [{ Prefix: "app/2.0.0/" }],
+      });
+      mockS3SkuVersionWithContent(
+        "app",
+        "2.0.0",
+        SDMMC_SKU,
+        "jetkvm_app",
+        content,
+        hash,
+      );
+
+      const req2 = createMockRequest({ sku: SDMMC_SKU });
+      const res2 = createMockResponse();
+
+      await RetrieveLatestApp(req2, res2);
+      expect(res2._redirectUrl).toBe(
+        "https://cdn.test.com/app/2.0.0/skus/jetkvm-v2-sdmmc/jetkvm_app",
+      );
+    });
+  });
+});
+
+describe("RetrieveLatestApp for the mini product", () => {
+  beforeEach(() => {
+    clearCaches();
+    s3Mock.reset();
+  });
+
+  it("rejects mini SKUs, which have no app artifact, before touching S3", async () => {
+    const res = createMockResponse();
+    await expect(
+      RetrieveLatestApp(createMockRequest({ sku: MINI_WIRELESS_SKU }), res),
+    ).rejects.toThrow(BadRequestError);
+    await expect(
+      RetrieveLatestApp(createMockRequest({ sku: MINI_WIRELESS_SKU }), res),
+    ).rejects.toThrow('SKU "jetkvm-mini-wireless" has no app artifact');
+    expect(s3Mock.calls().length).toBe(0);
+  });
+});
+
+describe("RetrieveLatestSystemRecovery S3 redirect handler", () => {
+  beforeEach(() => {
+    s3Mock.reset();
+    clearCaches();
+  });
+
+  it("answers 404, without an older image, when the newest version has no image for the SKU", async () => {
+    // 1.1.0 ships only JetKVM v2; 1.0.0 also has an SDMMC image
+    mockS3ListVersions("system", ["1.0.0", "1.1.0"]);
+    s3Mock.on(ListObjectsV2Command, { MaxKeys: 1 }).resolves({ Contents: [{ Key: "x" }] });
+    s3Mock.on(HeadObjectCommand).rejects({ name: "NotFound", $metadata: { httpStatusCode: 404 } });
+    s3Mock
+      .on(HeadObjectCommand, { Key: "system/1.0.0/skus/jetkvm-v2-sdmmc/update_sd.img.zip" })
+      .resolves({});
+
+    await expect(
+      RetrieveLatestSystemRecovery(
+        createMockRequest({ sku: "jetkvm-v2-sdmmc" }),
+        createMockResponse(),
+      ),
+    ).rejects.toThrow(NotFoundError);
+  });
+
+  it("should handle all invalid semver versions gracefully", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    // All versions are invalid semver - latestVersion will be null
+    s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+      CommonPrefixes: [
+        { Prefix: "system/not-a-version/" },
+        { Prefix: "system/invalid/" },
+        { Prefix: "system/v1.bad.format/" },
+      ],
+    });
+
+    await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(NotFoundError);
+  });
+
+  it("should throw NotFoundError when no system versions exist", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    s3Mock
+      .on(ListObjectsV2Command, { Prefix: "system/" })
+      .resolves({ CommonPrefixes: [] });
+
+    await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(NotFoundError);
+  });
+
+  it("should redirect to latest stable system recovery image", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+      CommonPrefixes: [
+        { Prefix: "system/1.0.0/" },
+        { Prefix: "system/1.1.0/" },
+        { Prefix: "system/1.2.0/" },
+      ],
+    });
+
+    const content = "system-recovery-image-content";
+    const crypto = await import("crypto");
+    const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+    mockS3LegacyVersionWithContent("system", "1.2.0", "update.img", content, hash);
+
+    await RetrieveLatestSystemRecovery(req, res);
+
+    expect(res.redirect).toHaveBeenCalledWith(
+      302,
+      "https://cdn.test.com/system/1.2.0/update.img",
+    );
+  });
+
+  it("should redirect to latest prerelease when prerelease=true", async () => {
+    const req = createMockRequest({ prerelease: "true" });
+    const res = createMockResponse();
+
+    s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+      CommonPrefixes: [{ Prefix: "system/1.0.0/" }, { Prefix: "system/2.0.0-alpha.1/" }],
+    });
+
+    const content = "system-prerelease-content";
+    const crypto = await import("crypto");
+    const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+    mockS3LegacyVersionWithContent(
+      "system",
+      "2.0.0-alpha.1",
+      "update.img",
+      content,
+      hash,
+    );
+
+    await RetrieveLatestSystemRecovery(req, res);
+
+    expect(res.redirect).toHaveBeenCalledWith(
+      302,
+      "https://cdn.test.com/system/2.0.0-alpha.1/update.img",
+    );
+  });
+
+  it("should throw NotFoundError when recovery image is missing", async () => {
+    const req = createMockRequest({});
+    const res = createMockResponse();
+
+    s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+      CommonPrefixes: [{ Prefix: "system/1.0.0/" }],
+    });
+
+    // Mock versionHasSkuSupport to return false (no SKU folders)
+    s3Mock.on(ListObjectsV2Command, { Prefix: "system/1.0.0/skus/" }).resolves({
+      Contents: [],
+    });
+
+    s3Mock
+      .on(HeadObjectCommand, { Key: "system/1.0.0/update.img" })
+      .rejects({ name: "NotFound", $metadata: { httpStatusCode: 404 } });
+
+    await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(NotFoundError);
+  });
+
+  describe("SKU handling", () => {
+    it("should use legacy path when no SKU provided on legacy version", async () => {
+      const req = createMockRequest({});
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/1.0.0/" }],
+      });
+
+      const content = "legacy-recovery-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("system", "1.0.0", "update.img", content, hash);
+
+      await RetrieveLatestSystemRecovery(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        "https://cdn.test.com/system/1.0.0/update.img",
+      );
+    });
+
+    it("should use legacy path when default SKU provided on legacy version", async () => {
+      const req = createMockRequest({ sku: "jetkvm-v2" });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/1.0.0/" }],
+      });
+
+      const content = "legacy-recovery-content-default-sku";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("system", "1.0.0", "update.img", content, hash);
+
+      await RetrieveLatestSystemRecovery(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        "https://cdn.test.com/system/1.0.0/update.img",
+      );
+    });
+
+    it("should throw NotFoundError when non-default SKU requested on legacy version", async () => {
+      const req = createMockRequest({ sku: SDMMC_SKU });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/1.0.0/" }],
+      });
+
+      // Mock versionHasSkuSupport to return false (no SKU folders)
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/1.0.0/skus/" }).resolves({
+        Contents: [],
+      });
+
+      await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(NotFoundError);
+      await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(
+        "has no artifact for SKU",
+      );
+    });
+
+    it("redirects SDMMC SKU to update_sd.img.zip when the S3 version has SKU support", async () => {
+      const req = createMockRequest({ sku: SDMMC_SKU });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/2.0.0/" }],
+      });
+
+      const content = "sdmmc-recovery-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3SkuVersionWithContent(
+        "system",
+        "2.0.0",
+        SDMMC_SKU,
+        "update_sd.img.zip",
+        content,
+        hash,
+      );
+
+      await RetrieveLatestSystemRecovery(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        `https://cdn.test.com/system/2.0.0/skus/${SDMMC_SKU}/update_sd.img.zip`,
+      );
+    });
+
+    it("should throw BadRequestError for an unmapped SKU", async () => {
+      const req = createMockRequest({ sku: "jetkvm-future" });
+      const res = createMockResponse();
+
+      // Even though we never reach S3, mock the listing so a regression that
+      // accepted unknown SKUs would surface as a different kind of failure
+      // rather than silently returning an unrelated error from S3.
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/1.0.0/" }],
+      });
+
+      await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(
+        BadRequestError,
+      );
+      await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(
+        'Unknown SKU "jetkvm-future"',
+      );
+    });
+
+    it("redirects a mini SKU to the full-flash image under the mini prefix", async () => {
+      s3Mock.on(ListObjectsV2Command, { Prefix: "mini/" }).resolves({
+        CommonPrefixes: [{ Prefix: "mini/1.0.0/" }, { Prefix: "mini/1.1.0/" }],
+      });
+
+      const content = "mini-full-flash";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+      mockS3SkuVersionWithContent(
+        "mini",
+        "1.1.0",
+        MINI_WIRELESS_SKU,
+        "jetkvm-mini-full.bin",
+        content,
+        hash,
+      );
+
+      const res = createMockResponse();
+      await RetrieveLatestSystemRecovery(createMockRequest({ sku: MINI_WIRELESS_SKU }), res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        `https://cdn.test.com/mini/1.1.0/skus/${MINI_WIRELESS_SKU}/jetkvm-mini-full.bin`,
+      );
+      expect(s3Mock.commandCalls(ListObjectsV2Command, { Prefix: "system/" }).length).toBe(0);
+    });
+
+    it("keeps separate recovery cache entries for JetKVM and mini SKUs", async () => {
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/2.0.0/" }],
+      });
+      s3Mock.on(ListObjectsV2Command, { Prefix: "mini/" }).resolves({
+        CommonPrefixes: [{ Prefix: "mini/1.0.0/" }],
+      });
+      const crypto = await import("crypto");
+      const systemContent = "system-recovery";
+      const miniContent = "mini-full-flash";
+      mockS3SkuVersionWithContent(
+        "system",
+        "2.0.0",
+        DEFAULT_SKU,
+        "update.img",
+        systemContent,
+        crypto.createHash("sha256").update(systemContent).digest("hex"),
+      );
+      mockS3SkuVersionWithContent(
+        "mini",
+        "1.0.0",
+        MINI_ETHERNET_SKU,
+        "jetkvm-mini-full.bin",
+        miniContent,
+        crypto.createHash("sha256").update(miniContent).digest("hex"),
+      );
+
+      const systemRes = createMockResponse();
+      await RetrieveLatestSystemRecovery(createMockRequest({ sku: DEFAULT_SKU }), systemRes);
+      const miniRes = createMockResponse();
+      await RetrieveLatestSystemRecovery(createMockRequest({ sku: MINI_ETHERNET_SKU }), miniRes);
+
+      expect(systemRes._redirectUrl).toBe(
+        "https://cdn.test.com/system/2.0.0/skus/jetkvm-v2/update.img",
+      );
+      expect(miniRes._redirectUrl).toBe(
+        `https://cdn.test.com/mini/1.0.0/skus/${MINI_ETHERNET_SKU}/jetkvm-mini-full.bin`,
+      );
+    });
+
+    it("should use default SKU when no SKU provided on version with SKU support", async () => {
+      const req = createMockRequest({});
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/2.0.0/" }],
+      });
+
+      const content = "default-sku-recovery-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3SkuVersionWithContent(
+        "system",
+        "2.0.0",
+        "jetkvm-v2",
+        "update.img",
+        content,
+        hash,
+      );
+
+      await RetrieveLatestSystemRecovery(req, res);
+
+      expect(res.redirect).toHaveBeenCalledWith(
+        302,
+        "https://cdn.test.com/system/2.0.0/skus/jetkvm-v2/update.img",
+      );
+    });
+
+    it("should throw NotFoundError when SDMMC zip missing on version with SKU support", async () => {
+      const req = createMockRequest({ sku: SDMMC_SKU });
+      const res = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/2.0.0/" }],
+      });
+
+      // Version has SKU support (jetkvm-v2 exists) but the SDMMC SKU folder
+      // hasn't shipped update_sd.img.zip for this version yet.
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/2.0.0/skus/" }).resolves({
+        Contents: [{ Key: "system/2.0.0/skus/jetkvm-v2/update.img" }],
+      });
+      s3Mock
+        .on(HeadObjectCommand, {
+          Key: `system/2.0.0/skus/${SDMMC_SKU}/update_sd.img.zip`,
+        })
+        .rejects({
+          name: "NoSuchKey",
+          $metadata: { httpStatusCode: 404 },
+        });
+
+      await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(NotFoundError);
+      await expect(RetrieveLatestSystemRecovery(req, res)).rejects.toThrow(
+        "has no artifact for SKU",
+      );
+    });
+  });
+
+  describe("cache behavior", () => {
+    it("should return cached redirect on second call with same parameters", async () => {
+      const req1 = createMockRequest({});
+      const res1 = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/1.0.0/" }],
+      });
+
+      const content = "cached-system-recovery-content";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("system", "1.0.0", "update.img", content, hash);
+
+      await RetrieveLatestSystemRecovery(req1, res1);
+      expect(res1._redirectUrl).toBe("https://cdn.test.com/system/1.0.0/update.img");
+
+      // Reset S3 mock to return different data
+      s3Mock.reset();
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/2.0.0/" }],
+      });
+      mockS3LegacyVersionWithContent(
+        "system",
+        "2.0.0",
+        "update.img",
+        "new-content",
+        "new-hash",
+      );
+
+      // Second call should return cached result (1.0.0), not new S3 data (2.0.0)
+      const req2 = createMockRequest({});
+      const res2 = createMockResponse();
+
+      await RetrieveLatestSystemRecovery(req2, res2);
+      expect(res2._redirectUrl).toBe("https://cdn.test.com/system/1.0.0/update.img");
+    });
+
+    it("should use different cache keys for different SKUs", async () => {
+      // First call with default SKU
+      const req1 = createMockRequest({});
+      const res1 = createMockResponse();
+
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/1.0.0/" }],
+      });
+
+      const content = "sku-cache-test-recovery";
+      const crypto = await import("crypto");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      mockS3LegacyVersionWithContent("system", "1.0.0", "update.img", content, hash);
+
+      await RetrieveLatestSystemRecovery(req1, res1);
+      expect(res1._redirectUrl).toBe("https://cdn.test.com/system/1.0.0/update.img");
+
+      // Second call with the SDMMC SKU should NOT use the cached eMMC result;
+      // it must re-resolve and pick up the SDMMC zip path instead.
+      s3Mock.reset();
+      s3Mock.on(ListObjectsV2Command, { Prefix: "system/" }).resolves({
+        CommonPrefixes: [{ Prefix: "system/2.0.0/" }],
+      });
+      mockS3SkuVersionWithContent(
+        "system",
+        "2.0.0",
+        SDMMC_SKU,
+        "update_sd.img.zip",
+        content,
+        hash,
+      );
+
+      const req2 = createMockRequest({ sku: SDMMC_SKU });
+      const res2 = createMockResponse();
+
+      await RetrieveLatestSystemRecovery(req2, res2);
+      expect(res2._redirectUrl).toBe(
+        `https://cdn.test.com/system/2.0.0/skus/${SDMMC_SKU}/update_sd.img.zip`,
+      );
+    });
+  });
+});

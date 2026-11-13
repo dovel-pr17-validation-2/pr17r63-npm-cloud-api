@@ -1,0 +1,74 @@
+name: 'Pull Request'
+on:
+  pull_request:
+    paths-ignore:
+      - .gitignore
+      - README.md
+      - LICENSE
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://jetkvm:jetkvm@localhost:5432/jetkvm?schema=public
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jetkvm
+          POSTGRES_PASSWORD: jetkvm
+          POSTGRES_DB: jetkvm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jetkvm -d jetkvm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+    - uses: actions/checkout@v4
+
+    # Pulls and starts in the background while dependencies install; the end-to-end tests use it
+    - name: Start S3-compatible store
+      run: nohup docker compose -f compose.development.yaml up -d s3 > "$RUNNER_TEMP/s3-start.log" 2>&1 &
+
+    - name: Use Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: v22.23.4
+        cache: 'npm'
+        cache-dependency-path: '**/package-lock.json'
+
+    - name: Cache NPM dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: npm-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+        restore-keys: |
+          npm-cache-${{ runner.os }}-
+
+    - name: Install Dependencies and Build
+      run: |
+        npm ci
+        npx prisma generate
+        npm run build
+      env:
+        CI: true
+
+    - name: Run Prisma Migrations
+      run: npx prisma migrate deploy
+
+    - name: Run Tests
+      run: npm test
+
+    - name: Run end-to-end tests
+      run: |
+        timeout 180 sh -c 'until curl -s -o /dev/null http://127.0.0.1:8333; do sleep 1; done' || { cat "$RUNNER_TEMP/s3-start.log"; exit 1; }
+        npx vitest run --config vitest.e2e.config.ts
+
+    - name: Cache Prisma Binary
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm/_npx
+        key: prisma-binary-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+        restore-keys: prisma-binary-${{ runner.os }}-
